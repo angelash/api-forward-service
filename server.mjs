@@ -74,7 +74,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method !== "POST") return text(res, 405, "Method Not Allowed");
     if (!checkServiceToken(req)) return json(res, 401, { ok: false, error: "invalid forward service token" });
-    if (url.pathname !== "/v1/chat/completions") return text(res, 404, "Not Found");
+
+    const normalizedPath = url.pathname.replace(/\/+$/, "") || "/";
+    const acceptedPaths = new Set(["/v1/chat/completions", "/chat/completions"]);
+    if (!acceptedPaths.has(normalizedPath)) return text(res, 404, "Not Found");
 
     const bodyRaw = await readBody(req);
     const parsed = safeJson(bodyRaw.toString("utf8"), {});
