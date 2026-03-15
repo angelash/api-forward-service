@@ -42,6 +42,21 @@ const oauthStateStore = new Map();
 const execFileAsync = promisify(execFile);
 
 const server = http.createServer(async (req, res) => {
+  const startedAt = Date.now();
+  const reqMethod = String(req.method || "").toUpperCase();
+  const reqPath = (() => {
+    try {
+      return new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).pathname;
+    } catch {
+      return req.url || "/";
+    }
+  })();
+  let reqModel = "";
+  res.on("finish", () => {
+    const ms = Date.now() - startedAt;
+    console.log(`[access] ${reqMethod} ${reqPath} -> ${res.statusCode} ${ms}ms${reqModel ? ` model=${reqModel}` : ""}`);
+  });
+
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
@@ -82,6 +97,7 @@ const server = http.createServer(async (req, res) => {
     const bodyRaw = await readBody(req);
     const parsed = safeJson(bodyRaw.toString("utf8"), {});
     const model = String(parsed?.model || "").trim();
+    reqModel = model;
     const useCodex = matchCodexModel(model);
 
     if (useCodex) {
