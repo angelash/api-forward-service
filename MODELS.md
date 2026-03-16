@@ -10,14 +10,17 @@
 
 ## Codex 分支（可用）
 
-以下模型名会命中 Codex 分支（示例）：
+以下模型名会命中 Codex 分支：
 
-- `openai-codex/gpt-5.3-codex`
-- `openai-codex/gpt-5.4`
-- `codex-*`（任何包含 `codex` 的模型名）
+- `gpt-5.3-codex`
+- `gpt-5.4`
+- `openai-codex/*`（兼容旧写法）
+
+匹配规则：`CODEX_MODEL_MATCH=openai-codex/,codex,gpt-5.4`
 
 实测：
-- `openai-codex/gpt-5.3-codex` ✅ 正常返回
+- `gpt-5.3-codex` ✅ 正常返回
+- `gpt-5.4` ✅ 正常返回
 
 ## Custom 分支（取决于上游 channel 配置）
 

@@ -26,7 +26,7 @@ curl -sS "${BASE_URL}/health"
 echo -e "\n"
 
 echo "== codex model example =="
-post_chat "openai-codex/gpt-5.3-codex" "你是谁？请简短回答。"
+post_chat "gpt-5.3-codex" "你是谁？请简短回答。"
 
 echo "== custom model example =="
-post_chat "custom/glm-5" "请只回复: API_OK"
+post_chat "glm-5" "请只回复: API_OK"
