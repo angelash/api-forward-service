@@ -3,7 +3,6 @@ import { URL } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const env = process.env;
@@ -15,6 +14,7 @@ const CUSTOM_UPSTREAM_CHAT_PATH = env.CUSTOM_UPSTREAM_CHAT_PATH || "/v1/chat/com
 const CUSTOM_UPSTREAM_API_KEY = env.CUSTOM_UPSTREAM_API_KEY || "";
 const CUSTOM_UPSTREAM_EXTRA_HEADERS = safeJson(env.CUSTOM_UPSTREAM_EXTRA_HEADERS || "{}", {});
 const CUSTOM_TIMEOUT_MS = Number(env.CUSTOM_TIMEOUT_MS || 180000);
+const CUSTOM_MODEL_ALIASES = parseAliasMap(env.CUSTOM_MODEL_ALIASES || "");
 
 const CODEX_MODEL_MATCH = (env.CODEX_MODEL_MATCH || "openai-codex/,codex")
   .split(",")
@@ -25,8 +25,11 @@ const CODEX_UPSTREAM_CHAT_PATH = env.CODEX_UPSTREAM_CHAT_PATH || "/v1/chat/compl
 const CODEX_REQUIRE_CLIENT_AUTH = String(env.CODEX_REQUIRE_CLIENT_AUTH || "true").toLowerCase() !== "false";
 const CODEX_FALLBACK_API_KEY = env.CODEX_FALLBACK_API_KEY || "";
 const CODEX_TIMEOUT_MS = Number(env.CODEX_TIMEOUT_MS || 180000);
+const CODEX_RESPONSE_MODEL_ALIAS = env.CODEX_RESPONSE_MODEL_ALIAS || "";
 
 const FORWARD_SERVICE_TOKEN = env.FORWARD_SERVICE_TOKEN || "";
+const DEBUG_RESPONSES = String(env.DEBUG_RESPONSES || "false").toLowerCase() === "true";
+const DEBUG_RESPONSE_MAX_CHARS = Number(env.DEBUG_RESPONSE_MAX_CHARS || 500);
 
 // ===== OAuth (independent flow for codex branch) =====
 const CODEX_OAUTH_ENABLED = String(env.CODEX_OAUTH_ENABLED || "false").toLowerCase() === "true";
@@ -39,7 +42,6 @@ const OAUTH_REDIRECT_URI = env.CODEX_OAUTH_REDIRECT_URI || `http://127.0.0.1:${P
 const OAUTH_TOKEN_FILE = env.CODEX_OAUTH_TOKEN_FILE || path.resolve(process.cwd(), "codex-oauth-token.json");
 
 const oauthStateStore = new Map();
-const execFileAsync = promisify(execFile);
 
 const server = http.createServer(async (req, res) => {
   const startedAt = Date.now();
@@ -108,6 +110,7 @@ const server = http.createServer(async (req, res) => {
         req,
         res,
         bodyRaw,
+        parsedRequest: parsed,
         upstreamBase: CODEX_UPSTREAM_BASE_URL,
         upstreamPath: CODEX_UPSTREAM_CHAT_PATH,
         timeoutMs: CODEX_TIMEOUT_MS,
@@ -117,10 +120,19 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    const normalizedCustomModel = mapCustomModel(model);
+    const customParsed = normalizedCustomModel && normalizedCustomModel !== model
+      ? { ...parsed, model: normalizedCustomModel }
+      : parsed;
+    const customBodyRaw = customParsed === parsed
+      ? bodyRaw
+      : Buffer.from(JSON.stringify(customParsed), "utf8");
+
     return forward({
       req,
       res,
-      bodyRaw,
+      bodyRaw: customBodyRaw,
+      parsedRequest: customParsed,
       upstreamBase: CUSTOM_UPSTREAM_BASE_URL,
       upstreamPath: CUSTOM_UPSTREAM_CHAT_PATH,
       timeoutMs: CUSTOM_TIMEOUT_MS,
@@ -141,6 +153,7 @@ async function forward({
   req,
   res,
   bodyRaw,
+  parsedRequest = null,
   upstreamBase,
   upstreamPath,
   timeoutMs,
@@ -183,20 +196,36 @@ async function forward({
   res.statusCode = upstreamResp.status;
   copyHeaders(upstreamResp, res);
 
-  if (!upstreamResp.body) return res.end();
-  const reader = upstreamResp.body.getReader();
-  const pump = async () => {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value) res.write(Buffer.from(value));
-    }
-    res.end();
-  };
-  pump().catch((err) => {
-    if (!res.headersSent) json(res, 502, { ok: false, error: `upstream stream failed: ${String(err?.message || err)}` });
-    else res.end();
-  });
+  const wantsStream = Boolean(parsedRequest?.stream);
+  if (wantsStream) {
+    if (!upstreamResp.body) return res.end();
+    const reader = upstreamResp.body.getReader();
+    const pump = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) res.write(Buffer.from(value));
+      }
+      if (DEBUG_RESPONSES) {
+        console.log(`[debug] stream response status=${upstreamResp.status} model=${String(parsedRequest?.model || "")}`);
+      }
+      res.end();
+    };
+    pump().catch((err) => {
+      if (!res.headersSent) json(res, 502, { ok: false, error: `upstream stream failed: ${String(err?.message || err)}` });
+      else res.end();
+    });
+    return;
+  }
+
+  const raw = await upstreamResp.text();
+  if (DEBUG_RESPONSES) {
+    const preview = redactSensitive(raw).slice(0, Math.max(100, DEBUG_RESPONSE_MAX_CHARS));
+    console.log(
+      `[debug] response status=${upstreamResp.status} model=${String(parsedRequest?.model || "")} body=${preview}`
+    );
+  }
+  res.end(raw);
 }
 
 function matchCodexModel(model) {
@@ -214,61 +243,64 @@ async function handleCodexChatCompletions({ req, res, parsed }) {
   const payload = buildCodexResponsesPayload(parsed);
 
   const timeoutMs = Math.max(1000, Number(CODEX_TIMEOUT_MS || 180000));
-  const payloadStr = JSON.stringify(payload);
 
-  let raw = "";
+  // Use Node.js fetch directly (more reliable than curl subprocess)
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+
+  let upstreamResp;
   try {
-    const { stdout, stderr } = await execFileAsync(
-      "curl",
-      [
-        "-sS",
-        "-X",
-        "POST",
-        String(upstreamUrl),
-        "-H",
-        `authorization: Bearer ${accessToken}`,
-        "-H",
-        `chatgpt-account-id: ${accountId}`,
-        "-H",
-        "openai-beta: responses=experimental",
-        "-H",
-        "originator: pi",
-        "-H",
-        "accept: text/event-stream",
-        "-H",
-        "content-type: application/json",
-        "--data",
-        payloadStr,
-      ],
-      { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 },
-    );
-    raw = String(stdout || "");
-    if (stderr) {
-      // curl may write progress/errors to stderr even with -sS
-      // ignore unless stdout is empty
-      if (!raw.trim()) return json(res, 502, { ok: false, error: String(stderr).trim() });
-    }
+    upstreamResp = await fetch(upstreamUrl, {
+      method: "POST",
+      headers: {
+        "authorization": `Bearer ${accessToken}`,
+        "chatgpt-account-id": accountId,
+        "openai-beta": "responses=experimental",
+        "originator": "pi",
+        "accept": "text/event-stream",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: ac.signal,
+    });
   } catch (err) {
-    return json(res, 502, { ok: false, error: `codex curl failed: ${String(err?.message || err)}` });
+    clearTimeout(timer);
+    const errOut = { ok: false, error: `codex fetch failed: ${String(err?.message || err)}` };
+    debugLog("codex.error", parsed?.model, errOut, 1000);
+    return json(res, 502, errOut);
   }
+  clearTimeout(timer);
 
+  // Read the entire SSE stream as text
+  const raw = await upstreamResp.text();
+
+  // Check for anti-bot page (non-SSE response)
   if (/cf_chl_opt|<html/i.test(raw)) {
-    return json(res, 502, {
+    const errOut = {
       ok: false,
       error: "codex upstream returned anti-bot/login page",
       rawPreview: raw.slice(0, 240),
       debug: { accountId, tokenPrefix: accessToken.slice(0, 12), tokenLen: accessToken.length },
-    });
+    };
+    debugLog("codex.error", parsed?.model, errOut, 1000);
+    return json(res, 502, errOut);
   }
 
+  // Parse SSE stream
   const parsedSse = parseCodexSse(raw);
   if (!parsedSse.text && !parsedSse.response) {
     const data = safeJson(raw, null);
-    if (data?.error) return json(res, 502, data);
-    return json(res, 502, { ok: false, error: "codex upstream returned empty stream", rawPreview: raw.slice(0, 240) });
+    if (data?.error) {
+      debugLog("codex.error", parsed?.model, data, 1000);
+      return json(res, 502, data);
+    }
+    const errOut = { ok: false, error: "codex upstream returned empty stream", rawPreview: raw.slice(0, 240) };
+    debugLog("codex.error", parsed?.model, errOut, 1000);
+    return json(res, 502, errOut);
   }
 
   const out = mapCodexResponsesToChatCompletion(parsedSse.response || { output_text: parsedSse.text }, parsed?.model, parsedSse.text);
+  debugLog("codex.ok", parsed?.model, out, DEBUG_RESPONSE_MAX_CHARS);
   return json(res, 200, out);
 }
 
@@ -285,14 +317,26 @@ function buildCodexResponsesPayload(parsed) {
       systemTexts.push(text);
       continue;
     }
-    input.push({
-      role: role === "assistant" ? "assistant" : "user",
-      content: [{ type: "input_text", text }],
-    });
+    // Codex Responses API format:
+    // - user messages: content is a string or array with type "input_text"
+    // - assistant messages: content must be array with type "output_text"
+    if (role === "assistant") {
+      input.push({
+        role: "assistant",
+        content: [{ type: "output_text", text }],
+      });
+    } else {
+      // user or other roles
+      input.push({
+        role: "user",
+        content: text,  // Direct string for user input
+      });
+    }
   }
 
   const rawModel = String(parsed?.model || "gpt-5.3-codex");
-  const model = rawModel.includes("/") ? rawModel.split("/").pop() : rawModel;
+  const normalizedModel = rawModel.includes("/") ? rawModel.split("/").pop() : rawModel;
+  const model = normalizeCodexUpstreamModel(normalizedModel);
 
   const body = {
     model,
@@ -309,15 +353,17 @@ function buildCodexResponsesPayload(parsed) {
 }
 
 function mapCodexResponsesToChatCompletion(data, reqModel, textOverride = "") {
-  const content = textOverride || extractCodexOutputText(data) || "";
+  const rawContent = textOverride || extractCodexOutputText(data) || "";
+  const content = sanitizeAssistantContent(rawContent);
   const usage = data?.usage || {};
   const prompt = Number(usage?.input_tokens || 0);
   const completion = Number(usage?.output_tokens || 0);
+  const responseModel = CODEX_RESPONSE_MODEL_ALIAS || reqModel || data?.model || "openai-codex/gpt-5.3-codex";
   return {
     id: data?.id || `chatcmpl_${randomString(12)}`,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: reqModel || data?.model || "openai-codex/gpt-5.3-codex",
+    model: responseModel,
     choices: [
       {
         index: 0,
@@ -378,9 +424,23 @@ function extractMessageText(content) {
   return content
     .map((p) => {
       if (typeof p === "string") return p;
-      if (p?.type === "text" && typeof p?.text === "string") return p.text;
+      if (!p || typeof p !== "object") return "";
+
+      // OpenAI-compatible message part variants seen in the wild:
+      // - { type: "text", text: "..." }
+      // - { type: "input_text", text: "..." }
+      // - { type: "output_text", text: "..." }
+      if ((p.type === "text" || p.type === "input_text" || p.type === "output_text") && typeof p.text === "string") {
+        return p.text;
+      }
+
+      // Some SDKs wrap text in nested fields.
+      if (typeof p.input_text === "string") return p.input_text;
+      if (typeof p.output_text === "string") return p.output_text;
+
       return "";
     })
+    .filter(Boolean)
     .join("\n")
     .trim();
 }
@@ -668,6 +728,57 @@ function json(res, status, obj) {
   res.statusCode = status;
   res.setHeader("content-type", "application/json; charset=utf-8");
   res.end(JSON.stringify(obj));
+}
+
+function debugLog(tag, model, payload, maxChars = DEBUG_RESPONSE_MAX_CHARS) {
+  if (!DEBUG_RESPONSES) return;
+  const text = typeof payload === "string" ? payload : JSON.stringify(payload);
+  const preview = redactSensitive(text).slice(0, Math.max(100, Number(maxChars || 500)));
+  console.log(`[debug] ${tag} model=${String(model || "")} body=${preview}`);
+}
+
+function redactSensitive(text) {
+  let out = String(text || "");
+  out = out.replace(/Bearer\s+[A-Za-z0-9\-_.]+/gi, "Bearer ***");
+  out = out.replace(/"(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)"\s*:\s*"[^"]+"/gi, '"$1":"***"');
+  return out;
+}
+
+function sanitizeAssistantContent(text) {
+  let out = String(text || "");
+  // Strip OpenClaw reply-routing tags if model accidentally outputs them.
+  out = out.replace(/^\s*\[\[\s*reply_to:[^\]]+\]\]\s*/i, "");
+  out = out.replace(/^\s*\[\[\s*reply_to_current\s*\]\]\s*/i, "");
+  return out.trim();
+}
+
+function normalizeCodexUpstreamModel(model) {
+  const m = String(model || "").trim().toLowerCase();
+  if (m === "5.3-proxy" || m === "gpt-5.3-proxy") return "gpt-5.3-codex";
+  return model;
+}
+
+function mapCustomModel(model) {
+  const key = String(model || "").trim().toLowerCase();
+  if (!key) return model;
+  return CUSTOM_MODEL_ALIASES.get(key) || model;
+}
+
+function parseAliasMap(raw) {
+  const map = new Map();
+  const text = String(raw || "").trim();
+  if (!text) return map;
+  for (const part of text.split(",")) {
+    const item = String(part || "").trim();
+    if (!item) continue;
+    const i = item.indexOf("=");
+    if (i <= 0) continue;
+    const k = item.slice(0, i).trim().toLowerCase();
+    const v = item.slice(i + 1).trim();
+    if (!k || !v) continue;
+    map.set(k, v);
+  }
+  return map;
 }
 
 function checkServiceToken(req) {
