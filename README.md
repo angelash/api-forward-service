@@ -1,66 +1,57 @@
-# API Forward Service
+# api-forward-service（龙虾接入版）
 
-独立转发服务（Node.js），先做你要的两段：
+这份文档只讲一件事：**怎么把这个服务接进龙虾（OpenClaw）里用**。
 
-1. **自定义 API 包装转发**
-   - 统一入口：`POST /v1/chat/completions`
-   - 当 `model` 不命中 Codex 规则时，转发到：`CUSTOM_UPSTREAM_BASE_URL + CUSTOM_UPSTREAM_CHAT_PATH`
+---
 
-2. **Codex 授权转发（同一路径按 model 分流）**
-   - 统一入口仍是：`POST /v1/chat/completions`
-   - 当 `model` 命中 `CODEX_MODEL_MATCH` 时，转发到：`CODEX_UPSTREAM_BASE_URL + CODEX_UPSTREAM_CHAT_PATH`
-   - 默认要求客户端带 `Authorization: Bearer <token>`
-
-## 启动
+## 1) 启动转发服务
 
 ```bash
-cd apps/api-forward-service
+cd /home/shash/clawd/apps/api-forward-service
 cp .env.example .env
-# 编辑 .env
+# 按你的环境填写 .env
 set -a && source .env && set +a
 npm run start
 ```
 
-## 健康检查
+服务默认监听：`http://127.0.0.1:43111`
+
+健康检查：
 
 ```bash
 curl http://127.0.0.1:43111/health
 ```
 
-## 独立 OAuth 授权（可选）
+返回 `ok: true` 再进行下一步。
 
-> 适用于你希望转发服务自己持有 Codex OAuth，不依赖 OpenClaw 本地链路。
+---
 
-1) 在 `.env` 填好 OAuth 参数，并设置 `CODEX_OAUTH_ENABLED=true`
+## 2) 在龙虾里配置这个转发入口
 
-2) 发起授权（推荐标准鉴权头）
+在龙虾配置中新增一个 **OpenAI 兼容 provider**，核心只要两项：
 
-```bash
-curl -H "Authorization: Bearer <service-token>" \
-  "http://127.0.0.1:43111/oauth/start"
-```
+- `baseUrl`: `http://127.0.0.1:43111`
+- `apiKey`: 你在 `.env` 里配置的 `FORWARD_SERVICE_TOKEN`
 
-返回里有 `authorizeUrl`，浏览器打开后完成授权。
+> 说明：龙虾侧请求会打到本服务的 `POST /v1/chat/completions`，由本服务按 `model` 做分流。
 
-3) 授权回调到 `/oauth/callback`，服务端会写入 token 文件（默认 `./codex-oauth-token.json`）
+建议把你要在龙虾里使用的模型名加到默认可选模型中（例如 `codex-forward/gpt-5.3-codex` 这一类），并设为主模型或可选模型。
 
-4) 查看状态
+---
 
-```bash
-curl -H "Authorization: Bearer <service-token>" \
-  "http://127.0.0.1:43111/oauth/status"
-```
+## 3) 验证龙虾是否已走转发链路
 
-> 兼容：仍支持旧头 `X-Forward-Token`，但建议迁移到标准 `Authorization: Bearer`。
+在龙虾里发起一条正常对话，然后看本服务日志：
 
-## 分流规则
+- 有请求日志（包含 `POST /v1/chat/completions`）
+- 能看到对应的 `model` 字段
+- 返回状态为 200
 
-- 请求 `POST /v1/chat/completions`
-- 从请求体读取 `model`
-- 如果 `model` 包含任一 `CODEX_MODEL_MATCH` 关键字（默认：`openai-codex/,codex`），走 Codex 上游
-- 否则走自定义 API 上游
+只要日志出现，说明龙虾已经通过这层转发服务在工作。
 
-## systemd（用户级）部署示例
+---
+
+## 4) 作为常驻服务运行（可选）
 
 `~/.config/systemd/user/api-forward-service.service`
 
@@ -81,8 +72,18 @@ RestartSec=2
 WantedBy=default.target
 ```
 
+启用：
+
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now api-forward-service
 systemctl --user status api-forward-service
 ```
+
+---
+
+## 5) 你只需要记住的三件事
+
+1. 先让 `api-forward-service` 本身健康运行。
+2. 龙虾 provider 指向 `http://127.0.0.1:43111`，并带 `FORWARD_SERVICE_TOKEN`。
+3. 在龙虾里实际发一条消息，确认转发服务日志里有命中记录。
